@@ -530,36 +530,32 @@ def run_measurement(device_index: Optional[int] = None) -> Tuple[GlobalResult, D
 #   PROGRAMACIÓN (SCHEDULE)
 # =========================
 
-def compute_next_run_from_cfg(cfg: Dict,
-                              now: Optional[datetime] = None) -> Optional[datetime]:
+def compute_next_run_from_cfg(cfg, now=None):
     sch = cfg.get("schedule", {})
-    if not sch.get("enabled", False):
+    if not sch.get("enabled"):
         return None
+
     if now is None:
         now = datetime.now()
 
-    mode = sch.get("mode", "daily")
-    hour = int(sch.get("hour", 22))
-    minute = int(sch.get("minute", 0))
+    hour = int(sch["hour"])
+    minute = int(sch["minute"])
+    mode = sch["mode"]
 
-    # base: siguiente día/hora
     candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
 
     if mode == "daily":
         if candidate <= now:
-            candidate = candidate.replace(day=candidate.day) + \
-                        (datetime.min - datetime.min)  # dummy para claridad
-            candidate = candidate + timedelta(days=1)  # type: ignore
+            candidate += timedelta(days=1)
         return candidate
 
-    else:  # weekly
-        from datetime import timedelta
-        weekday_target = int(sch.get("weekday", 0))  # 0=Mon
-        days_ahead = (weekday_target - now.weekday()) % 7
-        if days_ahead == 0 and candidate <= now:
-            days_ahead = 7
-        candidate = candidate + timedelta(days=days_ahead)
-        return candidate
+    if mode == "weekly":
+        weekday = int(sch["weekday"])  # 0=lunes
+        delta = (weekday - now.weekday()) % 7
+        if delta == 0 and candidate <= now:
+            delta = 7
+        return candidate + timedelta(days=delta)
+
 
 
 def should_run_now(cfg: Dict, now: Optional[datetime] = None) -> bool:
