@@ -301,6 +301,48 @@ class GlobalResult:
     level: str
     channels: List[ChannelResult]
 
+def analyze_fallback(x_ref, x_cur, fs):
+    """
+    Análisis simple cuando NO se detectan las 7 banderas.
+    Devuelve GlobalResult con un solo canal genérico.
+    """
+    rms_ref = rms_db(x_ref)
+    rms_cur = rms_db(x_cur)
+    crest_ref = crest_factor_db(x_ref)
+    crest_cur = crest_factor_db(x_cur)
+
+    diff_rms = rms_cur - rms_ref
+    diff_crest = crest_cur - crest_ref
+
+    estado = "VIVO" if rms_cur > -60 else "MUERTO"
+
+    # Evaluación simple
+    if abs(diff_rms) > 6 or abs(diff_crest) > 6:
+        evaluacion = "FAILED"
+    else:
+        evaluacion = "PASSED"
+
+    # Canal único genérico
+    ch = ChannelResult(
+        index=1,
+        evaluacion=evaluacion,
+        estado=estado,
+        ref_bands={},
+        cine_bands={},
+        delta_bands={},
+        rms_ref_db=float(round(rms_ref, 3)),
+        rms_cin_db=float(round(rms_cur, 3)),
+        crest_ref_db=float(round(crest_ref, 3)),
+        crest_cin_db=float(round(crest_cur, 3)),
+        spec95_db=0.0,
+    )
+
+    return GlobalResult(
+        overall="NO_CHANNEL_MARKERS",
+        level="Fallback",
+        channels=[ch]
+    )
+
 
 def analyze_6channels(x_ref: np.ndarray, x_cur: np.ndarray, fs: int,
                       eval_level: str, tolerances: Dict[str, Dict[str, float]]) -> GlobalResult:
@@ -530,7 +572,18 @@ def run_measurement(device_index: Optional[int] = None):
     eval_level = cfg["evaluation"]["level"]
     tolerances = cfg["evaluation"]["tolerances"]
 
-    global_res = analyze_6channels(x_ref, x_cur, fs, eval_level, tolerances)
+    # Detectar banderas
+    markers = detect_beep_markers(x_ref, fs)
+    
+    if len(markers) >= 7:
+        # Análisis normal 6 canales
+        global_res = analyze_6channels(x_ref, x_cur, fs, eval_level, tolerances)
+    else:
+        # Análisis fallback
+        print(f"[AudioCinema] Advertencia: solo se detectaron {len(markers)} banderas. "
+              "Usando análisis simplificado.")
+        global_res = analyze_fallback(x_ref, x_cur, fs)
+
 
     # === 4. Payload TB ===
     payload = build_thingsboard_payload(global_res)
