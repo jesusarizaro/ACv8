@@ -352,20 +352,40 @@ class AudioCinemaGUI:
                                                                             sticky="w", pady=4)
         ttk.Entry(pref, textvariable=ref_path_var, width=60).grid(row=0, column=1, sticky="w")
 
-        def record_ref_now():
-            fs_now = int(fs_var.get())
-            dur_now = float(dur_var.get())
-            dev_idx = pick_device_index_from_label(dev_var.get())
-            x = sd.rec(int(dur_now * fs_now), samplerate=fs_now,
-                       channels=1, dtype="float32", device=dev_idx)
-            sd.wait()
-            x = x.squeeze()
-            x = x.astype("float32")
-            x = x / (max(1e-9, np.max(np.abs(x))))
-            out = ASSETS_DIR / "reference_master.wav"
-            sf.write(str(out), x, fs_now)
-            ref_path_var.set(str(out))
-            messagebox.showinfo("Pista de referencia", f"Referencia guardada en:\n{out}")
+    def record_ref_now():
+        fs_now = int(fs_var.get())
+        dur_now = float(dur_var.get())
+    
+        # obtener dispositivo correctamente
+        dev_idx = pick_device_index_from_label(dev_var.get())
+    
+        # grabar
+        x = sd.rec(int(dur_now * fs_now),
+                   samplerate=fs_now,
+                   channels=1,
+                   dtype="float32",
+                   device=dev_idx)
+        sd.wait()
+    
+        x = x.squeeze()
+        x = x.astype("float32")
+    
+        # normalizar
+        m = np.max(np.abs(x))
+        if m > 0:
+            x = x / m
+    
+        out = Path(APP_DIR) / "assets" / "reference_master.wav"
+        sf.write(str(out), x, fs_now)
+    
+        ref_path_var.set(str(out))
+    
+        # actualizar config
+        self.cfg["reference"]["path"] = str(out)
+        save_config(self.cfg)
+    
+        messagebox.showinfo("Pista de referencia", f"Referencia guardada:\n{out}")
+
 
         ttk.Button(pref, text="Grabar referencia ahora",
                    command=record_ref_now).grid(row=1, column=0, sticky="w", pady=6)
