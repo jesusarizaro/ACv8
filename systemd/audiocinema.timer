@@ -1,0 +1,10 @@
+[Unit]
+Description=Timer for AudioCinema automatic measurement
+
+[Timer]
+OnCalendar=*-*-* *:*:00   # se dispara cada minuto
+Persistent=true
+Unit=audiocinema.service
+
+[Install]
+WantedBy=timers.target
