@@ -1,0 +1,9 @@
+[Unit]
+Description=AudioCinema automatic measurement
+After=sound.target network-online.target
+
+[Service]
+Type=oneshot
+User=pi
+WorkingDirectory=/opt/audiocinema
+ExecStart=/usr/bin/python3 /opt/audiocinema/audiocinema_core.py --scheduled
