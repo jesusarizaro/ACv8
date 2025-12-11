@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
-APP_DIR="$(cd "$(dirname "$0")" && pwd)"
-VENV="${APP_DIR}/venv"
 
-if [ ! -d "$VENV" ]; then
-  python3 -m venv "$VENV"
-  "${VENV}/bin/pip" install --upgrade pip wheel
-  [ -f "${APP_DIR}/requirements.txt" ] && "${VENV}/bin/pip" install -r "${APP_DIR}/requirements.txt"
+# Detectar carpeta real del programa
+APP_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Python del venv
+PY="$APP_DIR/venv/bin/python"
+
+# fallback si no existe el venv
+if [ ! -f "$PY" ]; then
+    PY="/usr/bin/python3"
 fi
 
-exec "${VENV}/bin/python" "${APP_DIR}/audiocinema_gui.py"
+exec "$PY" "$APP_DIR/src/audiocinema_gui.py"
