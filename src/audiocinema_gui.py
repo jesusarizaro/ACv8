@@ -15,6 +15,7 @@ GUI de AudioCinema
 from __future__ import annotations
 import traceback
 from datetime import datetime
+from datetime import timedelta
 from typing import Optional, List
 
 import tkinter as tk
