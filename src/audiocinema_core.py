@@ -6,7 +6,7 @@ Núcleo de AudioCinema (versión corregida y mejorada):
 - Manejo de configuración (YAML)
 - Grabación de audio
 - Análisis 6 canales REAL (detección de beeps en referencia y prueba)
-- Fallback si no hay 7 banderas por pista
+- Fallback si no hay 7 banderas por pista (6 canales genéricos)
 - Construcción de payload ThingsBoard
 - Ejecución headless (modo --once y --scheduled)
 """
@@ -176,7 +176,7 @@ def welch_psd_db(x: np.ndarray, fs: int, nperseg: int = 4096) -> Tuple[np.ndarra
 
 
 # =========================
-#   DETECCIÓN DE BEEPS
+#   DETECCIÓN DE BEEPS (ENERGÍA)
 # =========================
 
 def short_time_rms(x: np.ndarray, fs: int,
@@ -203,8 +203,8 @@ def detect_beep_markers(x: np.ndarray, fs: int,
                         thr_db_over_median: float = 10.0,
                         min_sep_s: float = 0.5) -> List[int]:
     """
-    Detecta beeps de energía (no por frecuencia) y devuelve índices de muestra.
-    Pensado para encontrar las 7 banderas.
+    Detecta beeps por energía (no por frecuencia) y devuelve índices de muestra.
+    Pensado para encontrar las 7 banderas, pero NO exige frecuencias concretas.
     """
     _, r = short_time_rms(x, fs)
     r_db = 20.0 * np.log10(r + 1e-20)
@@ -214,7 +214,7 @@ def detect_beep_markers(x: np.ndarray, fs: int,
 
     beeps = []
     i = 0
-    step_t = 0.01  # hop de RMS
+    step_t = 0.01  # hop de RMS (10 ms)
     n = len(above)
     while i < n:
         if above[i]:
@@ -242,7 +242,7 @@ def detect_beep_markers(x: np.ndarray, fs: int,
 
 
 # =========================
-#   RESULTADOS Y FALLBACK
+#   RESULTADOS
 # =========================
 
 @dataclass
@@ -267,44 +267,73 @@ class GlobalResult:
     channels: List[ChannelResult]
 
 
-def analyze_fallback(x_ref: np.ndarray, x_cur: np.ndarray, fs: int) -> GlobalResult:
+# =========================
+#   FALLBACK (SIN 7 BEEPS)
+# =========================
+
+def analyze_fallback(x_ref: np.ndarray,
+                     x_cur: np.ndarray,
+                     fs: int,
+                     eval_level: str,
+                     tolerances: Dict[str, Dict[str, float]]) -> GlobalResult:
     """
-    Análisis simple cuando NO se detectan bien las 7 banderas
-    en referencia y/o prueba. Compara RMS y crest global.
+    Análisis simple cuando NO se detectan correctamente las 7 banderas
+    en referencia y/o prueba.
+    - Compara RMS y crest global.
+    - Usa tolerancias según el nivel elegido.
+    - Genera 6 canales genéricos.
+    - Opción 3:
+        * overall PASSED  → canales VIVO
+        * overall FAILED → canales MUERTO
     """
     rms_ref = rms_db(x_ref)
     rms_cur = rms_db(x_cur)
     crest_ref = crest_factor_db(x_ref)
     crest_cur = crest_factor_db(x_cur)
 
-    estado = "VIVO" if rms_cur > -60 else "MUERTO"
-    evaluacion = "PASSED"
-    if abs(rms_cur - rms_ref) > 6 or abs(crest_cur - crest_ref) > 6:
-        evaluacion = "FAILED"
+    tol = tolerances.get(eval_level, tolerances["Medio"])
+    tol_rms = tol["rms_db"]
+    tol_crest = tol["crest_db"]
 
-    ch = ChannelResult(
-        index=1,
-        evaluacion=evaluacion,
-        estado=estado,
-        ref_bands={},
-        cine_bands={},
-        delta_bands={},
-        rms_ref_db=float(round(rms_ref, 3)),
-        rms_cin_db=float(round(rms_cur, 3)),
-        crest_ref_db=float(round(crest_ref, 3)),
-        crest_cin_db=float(round(crest_cur, 3)),
-        spec95_db=0.0,
-    )
+    fail_rms = abs(rms_cur - rms_ref) > tol_rms
+    fail_crest = abs(crest_cur - crest_ref) > tol_crest
+
+    if fail_rms or fail_crest:
+        evaluacion_global = "FAILED"
+    else:
+        evaluacion_global = "PASSED"
+
+    if evaluacion_global == "PASSED":
+        estado_ch = "VIVO"
+    else:
+        estado_ch = "MUERTO"
+
+    channels: List[ChannelResult] = []
+    for idx in range(1, 7):
+        ch = ChannelResult(
+            index=idx,
+            evaluacion=evaluacion_global,
+            estado=estado_ch,
+            ref_bands={},
+            cine_bands={},
+            delta_bands={},
+            rms_ref_db=float(round(rms_ref, 3)),
+            rms_cin_db=float(round(rms_cur, 3)),
+            crest_ref_db=float(round(crest_ref, 3)),
+            crest_cin_db=float(round(crest_cur, 3)),
+            spec95_db=0.0,
+        )
+        channels.append(ch)
 
     return GlobalResult(
-        overall=evaluacion,
+        overall=evaluacion_global,
         level="Fallback",
-        channels=[ch]
+        channels=channels,
     )
 
 
 # =========================
-#   NUEVO ANÁLISIS 6 CANALES DUAL
+#   ANÁLISIS 6 CANALES “DUAL”
 # =========================
 
 BANDS = {
@@ -331,14 +360,14 @@ def analyze_6channels_dual(x_ref: np.ndarray, x_cur: np.ndarray, fs: int,
     """
     Detección de beeps en referencia y prueba por separado y
     emparejamiento canal a canal.
+    Si faltan beeps o los segmentos salen raros, se usa fallback.
     """
     mr = detect_beep_markers(x_ref, fs)
     mc = detect_beep_markers(x_cur, fs)
 
-    # Si alguna pista no tiene 7 beeps, fallo a modo simple
     if len(mr) < 7 or len(mc) < 7:
         print(f"[AudioCinema] Beeps insuficientes (ref={len(mr)}, cur={len(mc)}). Fallback.")
-        return analyze_fallback(x_ref, x_cur, fs)
+        return analyze_fallback(x_ref, x_cur, fs, eval_level, tolerances)
 
     guard = int(0.06 * fs)  # 60 ms
     segs: List[Tuple[int, int, int, int]] = []
@@ -352,11 +381,15 @@ def analyze_6channels_dual(x_ref: np.ndarray, x_cur: np.ndarray, fs: int,
 
         if b_ref <= a_ref or b_cur <= a_cur:
             print("[AudioCinema] Segmento inválido, usando fallback.")
-            return analyze_fallback(x_ref, x_cur, fs)
+            return analyze_fallback(x_ref, x_cur, fs, eval_level, tolerances)
 
         segs.append((a_ref, b_ref, a_cur, b_cur))
 
     tol = tolerances.get(eval_level, tolerances["Medio"])
+    tol_rms = tol["rms_db"]
+    tol_band = tol["band_db"]
+    tol_crest = tol["crest_db"]
+    tol_spec = tol["spec95_db"]
 
     ch_results: List[ChannelResult] = []
 
@@ -391,10 +424,10 @@ def analyze_6channels_dual(x_ref: np.ndarray, x_cur: np.ndarray, fs: int,
         diff_rms = rms_cin - rms_ref
         diff_crest = crest_cin - crest_ref
 
-        fail_rms = abs(diff_rms) > tol["rms_db"]
-        fail_band = any(abs(v) > tol["band_db"] for v in delta.values())
-        fail_crest = abs(diff_crest) > tol["crest_db"]
-        fail_spec = spec95 > tol["spec95_db"]
+        fail_rms = abs(diff_rms) > tol_rms
+        fail_band = any(abs(v) > tol_band for v in delta.values())
+        fail_crest = abs(diff_crest) > tol_crest
+        fail_spec = spec95 > tol_spec
 
         # canal muerto si el RMS está MUY por debajo
         dead = (rms_cin < (rms_ref - 20.0)) or (rms_cin < -70.0)
