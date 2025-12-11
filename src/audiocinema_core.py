@@ -2,10 +2,11 @@
 # -*- coding: utf-8 -*-
 
 """
-Núcleo de AudioCinema:
+Núcleo de AudioCinema (versión corregida y mejorada):
 - Manejo de configuración (YAML)
 - Grabación de audio
-- Análisis 6 canales (1 mic, 7 beeps)
+- Análisis 6 canales REAL (detección de beeps en referencia y prueba)
+- Fallback si no hay 7 banderas por pista
 - Construcción de payload ThingsBoard
 - Ejecución headless (modo --once y --scheduled)
 """
@@ -15,8 +16,7 @@ import os
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from datetime import datetime, date
-from datetime import datetime, timedelta
+from datetime import datetime, date, timedelta
 from typing import Dict, List, Tuple, Optional
 
 import numpy as np
@@ -41,7 +41,6 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 ASSETS_DIR.mkdir(parents=True, exist_ok=True)
 
-
 # =========================
 #   CONFIGURACIÓN
 # =========================
@@ -53,12 +52,10 @@ DEFAULT_CONFIG: Dict = {
         "preferred_input_name": "",
     },
     "reference": {
-        # Cambia este path si quieres usar otro por defecto
         "path": str((ASSETS_DIR / "reference_master.wav").resolve())
     },
     "evaluation": {
-        "level": "Medio",  # Bajo / Medio / Alto
-        # tolerancias (pueden editarse en YAML si quieres)
+        "level": "Medio",
         "tolerances": {
             "Bajo":  {"rms_db": 6.0, "band_db": 8.0, "crest_db": 6.0, "spec95_db": 18.0},
             "Medio": {"rms_db": 3.0, "band_db": 5.0, "crest_db": 4.0, "spec95_db": 12.0},
@@ -73,11 +70,11 @@ DEFAULT_CONFIG: Dict = {
     },
     "schedule": {
         "enabled": False,
-        "mode": "daily",          # daily / weekly
-        "weekday": 0,             # 0 = Monday ... 6 = Sunday (para mode=weekly)
+        "mode": "daily",
+        "weekday": 0,
         "hour": 22,
         "minute": 0,
-        "last_run_date": "",      # YYYY-MM-DD, se actualiza automáticamente
+        "last_run_date": "",
     }
 }
 
@@ -89,17 +86,16 @@ def load_config() -> Dict:
     else:
         data = {}
 
-    # merge superficial
     cfg = DEFAULT_CONFIG | data
     for k in DEFAULT_CONFIG:
         if isinstance(DEFAULT_CONFIG[k], dict):
             cfg.setdefault(k, {})
             cfg[k] = DEFAULT_CONFIG[k] | cfg[k]
+
     return cfg
 
 
 def save_config(cfg: Dict) -> None:
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
         yaml.safe_dump(cfg, f, sort_keys=False, allow_unicode=True)
 
@@ -180,22 +176,26 @@ def welch_psd_db(x: np.ndarray, fs: int, nperseg: int = 4096) -> Tuple[np.ndarra
 
 
 # =========================
-#   SEGMENTACIÓN 6 CANALES
+#   DETECCIÓN DE BEEPS
 # =========================
 
-def short_time_rms(x: np.ndarray, fs: int, win_s: float = 0.02, hop_s: float = 0.01):
+def short_time_rms(x: np.ndarray, fs: int,
+                   win_s: float = 0.02, hop_s: float = 0.01):
     win = max(1, int(round(win_s * fs)))
     hop = max(1, int(round(hop_s * fs)))
     n = len(x)
+
     frames = 1 + max(0, (n - win) // hop)
     rms_vals = np.zeros(frames, dtype=np.float32)
     times = np.zeros(frames, dtype=np.float32)
+
     for i in range(frames):
         s = i * hop
         e = s + win
         seg = x[s:e]
         rms_vals[i] = np.sqrt(np.mean(seg**2) + 1e-20)
         times[i] = (s + win/2) / fs
+
     return times, rms_vals
 
 
@@ -204,7 +204,7 @@ def detect_beep_markers(x: np.ndarray, fs: int,
                         min_sep_s: float = 0.5) -> List[int]:
     """
     Detecta beeps de energía (no por frecuencia) y devuelve índices de muestra.
-    Pensado para encontrar las 7 banderas (5 kHz, 990 Hz x5, 1.5 kHz).
+    Pensado para encontrar las 7 banderas.
     """
     _, r = short_time_rms(x, fs)
     r_db = 20.0 * np.log10(r + 1e-20)
@@ -241,44 +241,9 @@ def detect_beep_markers(x: np.ndarray, fs: int,
     return final
 
 
-def build_channel_segments(markers: List[int], fs: int,
-                           guard_ms: int = 60) -> List[Tuple[int, int]]:
-    """
-    De 7 beeps → 6 segmentos (canales 1..6).
-    Segmento i: entre beep i y beep i+1, recortando guard_ms antes/después.
-    """
-    if len(markers) < 7:
-        return []
-    guard = int(round(guard_ms * 1e-3 * fs))
-    segs: List[Tuple[int, int]] = []
-    for i in range(6):  # canales 1..6
-        a = max(0, markers[i] + guard)
-        b = max(0, markers[i+1] - guard)
-        if b > a:
-            segs.append((a, b))
-    return segs
-
-
 # =========================
-#   ANÁLISIS POR CANAL
+#   RESULTADOS Y FALLBACK
 # =========================
-
-BANDS = {
-    "LFE": (30.0, 100.0),
-    "LF":  (30.0, 120.0),
-    "MF":  (120.0, 2000.0),
-    "HF":  (2000.0, 8000.0),
-}
-
-
-def band_energy_db(f: np.ndarray, psd_db: np.ndarray, band: Tuple[float, float]) -> float:
-    f1, f2 = band
-    mask = (f >= f1) & (f <= f2)
-    if not np.any(mask):
-        return -120.0
-    p_lin = 10.0 ** (psd_db[mask] / 10.0)
-    return 10.0 * np.log10(np.mean(p_lin) + 1e-30)
-
 
 @dataclass
 class ChannelResult:
@@ -301,28 +266,22 @@ class GlobalResult:
     level: str
     channels: List[ChannelResult]
 
-def analyze_fallback(x_ref, x_cur, fs):
+
+def analyze_fallback(x_ref: np.ndarray, x_cur: np.ndarray, fs: int) -> GlobalResult:
     """
-    Análisis simple cuando NO se detectan las 7 banderas.
-    Devuelve GlobalResult con un solo canal genérico.
+    Análisis simple cuando NO se detectan bien las 7 banderas
+    en referencia y/o prueba. Compara RMS y crest global.
     """
     rms_ref = rms_db(x_ref)
     rms_cur = rms_db(x_cur)
     crest_ref = crest_factor_db(x_ref)
     crest_cur = crest_factor_db(x_cur)
 
-    diff_rms = rms_cur - rms_ref
-    diff_crest = crest_cur - crest_ref
-
     estado = "VIVO" if rms_cur > -60 else "MUERTO"
-
-    # Evaluación simple
-    if abs(diff_rms) > 6 or abs(diff_crest) > 6:
+    evaluacion = "PASSED"
+    if abs(rms_cur - rms_ref) > 6 or abs(crest_cur - crest_ref) > 6:
         evaluacion = "FAILED"
-    else:
-        evaluacion = "PASSED"
 
-    # Canal único genérico
     ch = ChannelResult(
         index=1,
         evaluacion=evaluacion,
@@ -338,42 +297,72 @@ def analyze_fallback(x_ref, x_cur, fs):
     )
 
     return GlobalResult(
-        overall="NO_CHANNEL_MARKERS",
+        overall=evaluacion,
         level="Fallback",
         channels=[ch]
     )
 
 
-def analyze_6channels(x_ref: np.ndarray, x_cur: np.ndarray, fs: int,
-                      eval_level: str, tolerances: Dict[str, Dict[str, float]]) -> GlobalResult:
-    """
-    x_ref, x_cur: pistas completas (con beeps + barridos).
-    Devuelve resultados por canal.
-    """
-    # detectamos beeps sobre la referencia (patrón estable)
-    markers_ref = detect_beep_markers(x_ref, fs)
-    segs_ref = build_channel_segments(markers_ref, fs)
-    if len(segs_ref) != 6:
-        raise RuntimeError(f"Se esperaban 6 segmentos, se obtuvieron {len(segs_ref)}. "
-                           f"¿La pista tiene las 7 banderas correctamente?")
+# =========================
+#   NUEVO ANÁLISIS 6 CANALES DUAL
+# =========================
 
-    # en el registro real también habrá beeps, pero usamos mismos índices
-    # asumiendo que el tiempo total es muy similar; recortamos por longitud mínima
-    n = min(len(x_ref), len(x_cur))
-    x_ref = x_ref[:n]
-    x_cur = x_cur[:n]
+BANDS = {
+    "LFE": (30.0, 100.0),
+    "LF":  (30.0, 120.0),
+    "MF":  (120.0, 2000.0),
+    "HF":  (2000.0, 8000.0),
+}
+
+
+def band_energy_db(f: np.ndarray, psd_db: np.ndarray,
+                   band: Tuple[float, float]) -> float:
+    f1, f2 = band
+    mask = (f >= f1) & (f <= f2)
+    if not np.any(mask):
+        return -120.0
+    p_lin = 10.0 ** (psd_db[mask] / 10.0)
+    return 10.0 * np.log10(np.mean(p_lin) + 1e-30)
+
+
+def analyze_6channels_dual(x_ref: np.ndarray, x_cur: np.ndarray, fs: int,
+                           eval_level: str,
+                           tolerances: Dict[str, Dict[str, float]]) -> GlobalResult:
+    """
+    Detección de beeps en referencia y prueba por separado y
+    emparejamiento canal a canal.
+    """
+    mr = detect_beep_markers(x_ref, fs)
+    mc = detect_beep_markers(x_cur, fs)
+
+    # Si alguna pista no tiene 7 beeps, fallo a modo simple
+    if len(mr) < 7 or len(mc) < 7:
+        print(f"[AudioCinema] Beeps insuficientes (ref={len(mr)}, cur={len(mc)}). Fallback.")
+        return analyze_fallback(x_ref, x_cur, fs)
+
+    guard = int(0.06 * fs)  # 60 ms
+    segs: List[Tuple[int, int, int, int]] = []
+
+    for i in range(6):
+        a_ref = max(0, mr[i] + guard)
+        b_ref = max(0, mr[i + 1] - guard)
+
+        a_cur = max(0, mc[i] + guard)
+        b_cur = max(0, mc[i + 1] - guard)
+
+        if b_ref <= a_ref or b_cur <= a_cur:
+            print("[AudioCinema] Segmento inválido, usando fallback.")
+            return analyze_fallback(x_ref, x_cur, fs)
+
+        segs.append((a_ref, b_ref, a_cur, b_cur))
 
     tol = tolerances.get(eval_level, tolerances["Medio"])
-    tol_rms = tol["rms_db"]
-    tol_band = tol["band_db"]
-    tol_crest = tol["crest_db"]
-    tol_spec = tol["spec95_db"]
 
     ch_results: List[ChannelResult] = []
 
-    for idx, (a, b) in enumerate(segs_ref, start=1):
-        seg_ref = x_ref[a:b]
-        seg_cur = x_cur[a:b]
+    for idx, (ar, br, ac, bc) in enumerate(segs, start=1):
+        seg_ref = x_ref[ar:br]
+        seg_cur = x_cur[ac:bc]
 
         # RMS y Crest
         rms_ref = rms_db(seg_ref)
@@ -402,10 +391,10 @@ def analyze_6channels(x_ref: np.ndarray, x_cur: np.ndarray, fs: int,
         diff_rms = rms_cin - rms_ref
         diff_crest = crest_cin - crest_ref
 
-        fail_rms = abs(diff_rms) > tol_rms
-        fail_band = any(abs(v) > tol_band for v in delta.values())
-        fail_crest = abs(diff_crest) > tol_crest
-        fail_spec = spec95 > tol_spec
+        fail_rms = abs(diff_rms) > tol["rms_db"]
+        fail_band = any(abs(v) > tol["band_db"] for v in delta.values())
+        fail_crest = abs(diff_crest) > tol["crest_db"]
+        fail_spec = spec95 > tol["spec95_db"]
 
         # canal muerto si el RMS está MUY por debajo
         dead = (rms_cin < (rms_ref - 20.0)) or (rms_cin < -70.0)
@@ -416,21 +405,22 @@ def analyze_6channels(x_ref: np.ndarray, x_cur: np.ndarray, fs: int,
 
         estado = "MUERTO" if dead else "VIVO"
 
-        ch_results.append(ChannelResult(
-            index=idx,
-            evaluacion=evaluacion,
-            estado=estado,
-            ref_bands={k: float(round(v, 3)) for k, v in bands_ref.items()},
-            cine_bands={k: float(round(v, 3)) for k, v in bands_cin.items()},
-            delta_bands={k: float(round(v, 3)) for k, v in delta.items()},
-            rms_ref_db=float(round(rms_ref, 3)),
-            rms_cin_db=float(round(rms_cin, 3)),
-            crest_ref_db=float(round(crest_ref, 3)),
-            crest_cin_db=float(round(crest_cin, 3)),
-            spec95_db=float(round(spec95, 3)),
-        ))
+        ch_results.append(
+            ChannelResult(
+                index=idx,
+                evaluacion=evaluacion,
+                estado=estado,
+                ref_bands={k: float(round(v, 3)) for k, v in bands_ref.items()},
+                cine_bands={k: float(round(v, 3)) for k, v in bands_cin.items()},
+                delta_bands={k: float(round(v, 3)) for k, v in delta.items()},
+                rms_ref_db=float(round(rms_ref, 3)),
+                rms_cin_db=float(round(rms_cin, 3)),
+                crest_ref_db=float(round(crest_ref, 3)),
+                crest_cin_db=float(round(crest_cin, 3)),
+                spec95_db=float(round(spec95, 3)),
+            )
+        )
 
-    # overall = FAILED si cualquiera falla o está muerto
     overall = "PASSED"
     if any(ch.evaluacion != "PASSED" for ch in ch_results):
         overall = "FAILED"
@@ -449,11 +439,10 @@ def analyze_6channels(x_ref: np.ndarray, x_cur: np.ndarray, fs: int,
 def build_thingsboard_payload(global_res: GlobalResult,
                               extra_meta: Optional[Dict] = None) -> Dict:
     """
-    Construye el payload EXACTO con Canal1..Canal6 y algo de resumen.
+    Construye el payload con Canal1..CanalN y resumen global.
     """
     payload: Dict = {}
 
-    # 6 canales
     for ch in global_res.channels:
         name = f"Canal{ch.index}"
         payload[name] = {
@@ -462,9 +451,11 @@ def build_thingsboard_payload(global_res: GlobalResult,
             "ref": ch.ref_bands,
             "cine": ch.cine_bands,
             "delta": ch.delta_bands,
+            "rms": {"ref_db": ch.rms_ref_db, "cin_db": ch.rms_cin_db},
+            "crest": {"ref_db": ch.crest_ref_db, "cin_db": ch.crest_cin_db},
+            "spec95_db": ch.spec95_db,
         }
 
-    # resumen global opcional
     payload["Resumen"] = {
         "overall": global_res.overall,
         "level": global_res.level,
@@ -482,6 +473,7 @@ def send_to_thingsboard(payload: Dict, cfg: Dict) -> bool:
     token = tb.get("token", "").strip()
     if not token:
         return False
+
     host = tb.get("host", "thingsboard.cloud")
     port = int(tb.get("port", 1883))
     use_tls = bool(tb.get("use_tls", False))
@@ -497,8 +489,6 @@ def send_to_thingsboard(payload: Dict, cfg: Dict) -> bool:
 
         client.connect(host, port, keepalive=30)
         topic = "v1/devices/me/telemetry"
-
-        # solo un envío (payload ya compacto)
         client.publish(topic, json.dumps(payload), qos=1)
         client.loop(timeout=2.0)
         client.disconnect()
@@ -518,7 +508,6 @@ def _load_reference(ref_path: Path, fs_target: int) -> np.ndarray:
     x, fs = sf.read(str(ref_path), dtype="float32", always_2d=False)
     x = normalize_mono(x)
     if fs != fs_target:
-        # re-muestreo simple por interpolación
         n_new = int(round(len(x) * fs_target / fs))
         idx_old = np.linspace(0, 1, len(x))
         idx_new = np.linspace(0, 1, n_new)
@@ -537,76 +526,57 @@ def run_measurement(device_index: Optional[int] = None):
       - x_ref:        np.ndarray
       - x_cur:        np.ndarray
       - fs:           int
-      - sent:         bool (si se envió a TB)
+      - sent:         bool
     """
-
     cfg = load_config()
     fs = int(cfg["audio"]["fs"])
     dur = float(cfg["audio"]["duration_s"])
 
-    # === 1. Cargar referencia ===
+    # 1) referencia
     ref_path = Path(cfg["reference"]["path"])
     x_ref = _load_reference(ref_path, fs)
 
-    # Ajustar referencia a duración exacta
     target_len = int(round(fs * dur))
-
     if len(x_ref) > target_len:
         x_ref = x_ref[:target_len]
     elif len(x_ref) < target_len:
         x_ref = np.pad(x_ref, (0, target_len - len(x_ref)))
 
-    # === 2. Grabar pista de prueba ===
+    # 2) prueba
     x_cur = record_audio(dur, fs=fs, channels=1, device=device_index)
-
-    # Normalizar pista actual
     m = np.max(np.abs(x_cur)) + 1e-12
     x_cur = x_cur / m
 
-    # Asegurar igual longitud
+    # asegurar igual longitud
     L = min(len(x_ref), len(x_cur))
     x_ref = x_ref[:L]
     x_cur = x_cur[:L]
 
-    # === 3. Evaluación ===
+    # 3) análisis
     eval_level = cfg["evaluation"]["level"]
     tolerances = cfg["evaluation"]["tolerances"]
 
-    # Detectar banderas
-    markers = detect_beep_markers(x_ref, fs)
-    
-    if len(markers) >= 7:
-        # Análisis normal 6 canales
-        global_res = analyze_6channels(x_ref, x_cur, fs, eval_level, tolerances)
-    else:
-        # Análisis fallback
-        print(f"[AudioCinema] Advertencia: solo se detectaron {len(markers)} banderas. "
-              "Usando análisis simplificado.")
-        global_res = analyze_fallback(x_ref, x_cur, fs)
+    global_res = analyze_6channels_dual(x_ref, x_cur, fs, eval_level, tolerances)
 
-
-    # === 4. Payload TB ===
+    # 4) payload
     payload = build_thingsboard_payload(global_res)
 
-    # === 5. Guardar JSON ===
+    # 5) guardar JSON
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     out = REPORTS_DIR / f"analysis_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.json"
-
     with open(out, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
-    # === 6. Enviar a ThingsBoard ===
+    # 6) enviar
     sent = send_to_thingsboard(payload, cfg)
     payload["Meta"] = payload.get("Meta", {})
     payload["Meta"]["sent_to_thingsboard"] = sent
 
-    # actualizar JSON con flag sent
+    # actualizar JSON con el flag
     with open(out, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
-    # === 7. DEVOLVER SIEMPRE 7 valores ===
     return global_res, payload, out, x_ref, x_cur, fs, sent
-
 
 
 # =========================
@@ -640,9 +610,7 @@ def compute_next_run_from_cfg(cfg, now=None):
         return candidate + timedelta(days=delta)
 
 
-
 def should_run_now(cfg: Dict, now: Optional[datetime] = None) -> bool:
-    from datetime import timedelta
     sch = cfg.get("schedule", {})
     if not sch.get("enabled", False):
         return False
@@ -653,17 +621,14 @@ def should_run_now(cfg: Dict, now: Optional[datetime] = None) -> bool:
     hour = int(sch.get("hour", 22))
     minute = int(sch.get("minute", 0))
 
-    # ventana de 1 minuto
     if now.hour != hour or now.minute != minute:
         return False
 
-    # chequeamos día (para weekly)
     if mode == "weekly":
         weekday_target = int(sch.get("weekday", 0))
         if now.weekday() != weekday_target:
             return False
 
-    # evitamos correr dos veces el mismo día
     last_run_str = sch.get("last_run_date", "")
     if last_run_str:
         try:
@@ -698,7 +663,7 @@ def main_cli():
     args = parser.parse_args()
 
     if args.once:
-        res, payload, out, _, _, _ = run_measurement(device_index=None)
+        res, payload, out, *_ = run_measurement(device_index=None)
         print(f"[AudioCinema] Resultado global: {res.overall}  JSON: {out}")
         return
 
@@ -706,7 +671,7 @@ def main_cli():
         cfg = load_config()
         if should_run_now(cfg):
             print("[AudioCinema] Hora programada alcanzada, ejecutando medición…")
-            res, payload, out, _, _, _ = run_measurement(device_index=None)
+            res, payload, out, *_ = run_measurement(device_index=None)
             mark_run_today(cfg)
             print(f"[AudioCinema] Resultado global: {res.overall}  JSON: {out}")
         else:
