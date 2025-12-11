@@ -484,46 +484,60 @@ def _load_reference(ref_path: Path, fs_target: int) -> np.ndarray:
     return x
 
 
-def run_measurement(device_index: Optional[int] = None) -> Tuple[GlobalResult, Dict,
-                                                                 Path, np.ndarray, np.ndarray, int]:
-    """
-    Ejecuta una medición completa leyendo config.yaml.
-    Devuelve:
-      - GlobalResult
-      - payload TB
-      - ruta JSON guardado
-      - x_ref, x_cur, fs (para graficar en la GUI)
-    """
+def run_measurement(device_index=None):
     cfg = load_config()
+
     fs = int(cfg["audio"]["fs"])
     dur = float(cfg["audio"]["duration_s"])
+    ref_path = cfg["reference"]["path"]
 
-    ref_path = Path(cfg["reference"]["path"])
-    x_ref = _load_reference(ref_path, fs)
-    x_cur = record_audio(dur, fs=fs, channels=1, device=device_index)
+    # --- 1. cargar referencia ---
+    if not os.path.exists(ref_path):
+        raise FileNotFoundError(f"Archivo de referencia no encontrado:\n{ref_path}")
 
+    x_ref, fs_ref = sf.read(ref_path, dtype="float32")
+
+    # convertir a mono
+    if x_ref.ndim > 1:
+        x_ref = x_ref.mean(axis=1)
+
+    # resample si es necesario
+    if fs_ref != fs:
+        import scipy.signal
+        factor = fs / fs_ref
+        x_ref = scipy.signal.resample(x_ref, int(len(x_ref) * factor))
+
+    # recortar o rellenar referencia
+    target_len = int(fs * dur)
+    if len(x_ref) > target_len:
+        x_ref = x_ref[:target_len]
+    else:
+        x_ref = np.pad(x_ref, (0, target_len - len(x_ref)))
+
+    # --- 2. grabar pista de prueba ---
+    x_cur = sd.rec(target_len, samplerate=fs, channels=1,
+                   dtype="float32", device=device_index)
+    sd.wait()
+    x_cur = x_cur.squeeze()
+
+    # normalizar prueba
+    m = np.max(np.abs(x_cur)) + 1e-12
+    x_cur = x_cur / m
+
+    # --- 3. análisis ---
     eval_level = cfg["evaluation"]["level"]
     tolerances = cfg["evaluation"]["tolerances"]
 
-    global_res = analyze_6channels(x_ref, x_cur, fs, eval_level, tolerances)
-    payload = build_thingsboard_payload(global_res)
+    res = analyze_6channels(x_ref, x_cur, fs, eval_level, tolerances)
 
-    # guardar JSON
-    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-    out = REPORTS_DIR / f"analysis_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.json"
-    with open(out, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
+    # --- 4. JSON output ---
+    out_path, payload = build_json_output(res, x_ref, x_cur, fs)
 
-    # enviar siempre a TB
-    sent = send_to_thingsboard(payload, cfg)
-    payload["Meta"] = payload.get("Meta", {})
-    payload["Meta"]["sent_to_thingsboard"] = sent
+    # --- 5. enviar a ThingsBoard ---
+    send_to_thingsboard(payload, cfg["thingsboard"])
 
-    # volver a guardar JSON con el flag
-    with open(out, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
+    return res, payload, out_path, x_ref, x_cur, fs, True
 
-    return global_res, payload, out, x_ref, x_cur, fs
 
 
 # =========================
