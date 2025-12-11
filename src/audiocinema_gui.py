@@ -574,9 +574,8 @@ class AudioCinemaGUI:
     def _run_once(self):
         dev_idx = pick_device_index_from_label(self.input_device_label.get())
         # Permite que run_measurement devuelva 6 o 7 valores
-        res, payload, out_path, x_ref, x_cur, fs, *rest = run_measurement(
-            device_index=dev_idx
-        )
+        res, payload, out_path, x_ref, x_cur, fs, sent = run_measurement(device_index=dev_idx)
+
 
         self.last_ref = x_ref
         self.last_cur = x_cur
